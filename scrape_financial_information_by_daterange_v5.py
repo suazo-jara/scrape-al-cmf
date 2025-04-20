@@ -113,11 +113,15 @@ class GET_FINANCIAL_DATA:
         driver.get('https://www.cmfchile.cl/portal/principal/613/w3-propertyvalue-18591.html')
         try:
             WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'Estado')))
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            select = Select(driver.find_element(By.ID, 'Estado'))
-            driver.execute_script("arguments[0].value='TO';", driver.find_element(By.ID, 'Estado'))
-            driver.find_element(By.ID, 'Estado').send_keys(Keys.RETURN)
+            
+            #driver.execute_script("arguments[0].value = 'TO'; arguments[0].dispatchEvent(new Event('change'))", driver.find_element(By.ID, 'Estado')) # 'TO' es el valor para "Todas"
+            #driver.execute_script("arguments[0].value = 'VI'; arguments[0].dispatchEvent(new Event('change'))", driver.find_element(By.ID, 'Estado')) # 'VI' es el valor para "Vigentes"
+            driver.execute_script("arguments[0].value = 'NV'; arguments[0].dispatchEvent(new Event('change'))", driver.find_element(By.ID, 'Estado')) # 'NV' es el valor para "No Vigentes"
+
+            # Esperar a que se carguen los resultados
             time.sleep(5)
+            
+            # Scroll para cargar todos los elementos
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             lh = driver.execute_script("return document.body.scrollHeight")
             while True:
@@ -127,6 +131,7 @@ class GET_FINANCIAL_DATA:
                 if nh == lh:
                     break
                 lh = nh       
+            
             time.sleep(5)
             html = driver.page_source
             soup = BeautifulSoup(html, "html.parser")
@@ -142,6 +147,8 @@ class GET_FINANCIAL_DATA:
                     continue
         except TimeoutException:
             print("Loading took too much time!")
+        except Exception as e:
+            print(f"Error selecting 'No Vigentes' option: {e}")
         driver.quit()
         return link_lst
     
