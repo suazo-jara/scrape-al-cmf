@@ -2,6 +2,7 @@ import time
 import csv
 import os
 import json
+import requests
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.firefox.options import Options
@@ -13,6 +14,7 @@ from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
 from bs4 import BeautifulSoup
 import urllib.parse
+import re
 
 class CMF_REDIRECTION_DETECTOR:
     def __init__(self):
@@ -154,21 +156,138 @@ class CMF_REDIRECTION_DETECTOR:
             
         return company_info
     
+    def check_if_pdf_or_external(self, driver, url):
+        """
+        Verifica si un enlace lleva a un PDF o a un portal externo
+        Returns: 
+            - is_pdf (bool): True si es PDF
+            - is_external (bool): True si redirecciona a portal externo
+            - final_url (str): URL final después de redirecciones
+        """
+        original_url = driver.current_url
+        original_domain = urllib.parse.urlparse(original_url).netloc
+        
+        # Completa la URL si es relativa
+        if url.startswith('/'):
+            base_url = f"https://{original_domain}"
+            complete_url = base_url + url
+        else:
+            complete_url = url
+            
+        print(f"Comprobando enlace: {complete_url}")
+        
+        try:
+            # Método 1: Verificar headers con requests para detectar tipo de contenido
+            # Usamos head para no descargar el archivo completo
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                response = requests.head(complete_url, headers=headers, allow_redirects=True, timeout=10)
+                
+                # Verificar el Content-Type
+                content_type = response.headers.get('Content-Type', '').lower()
+                content_disposition = response.headers.get('Content-Disposition', '').lower()
+                
+                if 'application/pdf' in content_type or '.pdf' in content_disposition:
+                    return True, False, response.url
+                
+                # Si llega aquí y la URL final es diferente del dominio original
+                final_domain = urllib.parse.urlparse(response.url).netloc
+                if original_domain != final_domain and final_domain != '':
+                    return False, True, response.url
+                    
+            except Exception as e:
+                print(f"No se pudo verificar con requests: {e}")
+            
+            # Método 2: Navegar con Selenium como plan B
+            # Guardamos la ventana original para volver después
+            original_window = driver.current_window_handle
+            
+            # Abrimos el enlace en una nueva pestaña
+            driver.execute_script(f"window.open('{complete_url}', '_blank');")
+            time.sleep(2)
+            
+            # Cambiamos a la nueva pestaña
+            windows = driver.window_handles
+            driver.switch_to.window(windows[-1])
+            
+            # Esperar a que cargue la página (con timeout reducido)
+            wait = WebDriverWait(driver, 10)
+            try:
+                wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
+            except:
+                pass
+                
+            final_url = driver.current_url
+            final_domain = urllib.parse.urlparse(final_url).netloc
+                
+            # Verificar si es PDF por la URL o por el contenido de la página
+            is_pdf = False
+            is_external = False
+            
+            # Verificar si la URL termina en .pdf
+            if final_url.lower().endswith('.pdf'):
+                is_pdf = True
+            
+            # Verificar si estamos en un dominio externo
+            if original_domain != final_domain and final_domain != '':
+                is_external = True
+                
+            # Verificar si es un PDF por el contenido de la página
+            if not is_pdf:
+                try:
+                    # Si la página tiene un objeto embed o iframe con PDF, es un visor de PDF
+                    pdf_elements = driver.find_elements(By.CSS_SELECTOR, 'embed[type="application/pdf"], iframe[src$=".pdf"]')
+                    if pdf_elements:
+                        is_pdf = True
+                        
+                    # Verificar si hay elementos que indican un portal externo (más de 5 enlaces, menús, etc.)
+                    links = driver.find_elements(By.TAG_NAME, 'a')
+                    if len(links) > 5:
+                        is_external = True
+                        
+                    # Verificar el título de la página para indicios de portal
+                    page_title = driver.title.lower()
+                    portal_keywords = ['portal', 'sitio', 'inicio', 'home', 'web', 'bienvenido']
+                    if any(keyword in page_title for keyword in portal_keywords):
+                        is_external = True
+                        
+                except Exception as e:
+                    print(f"Error al analizar contenido: {e}")
+            
+            # Cerramos la pestaña y volvemos a la original
+            driver.close()
+            driver.switch_to.window(original_window)
+            
+            return is_pdf, is_external, final_url
+            
+        except Exception as e:
+            print(f"Error al verificar enlace {complete_url}: {e}")
+            # En caso de error, volvemos a la ventana original si es necesario
+            try:
+                current_handles = driver.window_handles
+                if len(current_handles) > 1 and driver.current_window_handle != original_window:
+                    driver.close()
+                    driver.switch_to.window(original_window)
+            except:
+                pass
+            return False, False, url
+    
     def detect_external_download_links(self, link):
         """Detectar si los enlaces de descarga de memorias anuales redirigen a portales externos"""
         original_url = 'https://www.cmfchile.cl/' + link
         company_info = {'RUT': '', 'Nombre': ''}
         external_links = []
         
-        # Instancia principal del driver para la navegación
-        main_driver = self.setup_driver()
+        driver = self.setup_driver()
         
         try:
             # Obtener información básica de la empresa
-            main_driver.get(original_url)
-            WebDriverWait(main_driver, 15).until(EC.presence_of_element_located((By.ID, 'contenido')))
+            driver.get(original_url)
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, 'contenido')))
             
-            html = main_driver.page_source
+            html = driver.page_source
             soup = BeautifulSoup(html, "html.parser")
             table = soup.findChildren('table')[0]
             rows = table.findChildren('tr')
@@ -176,37 +295,18 @@ class CMF_REDIRECTION_DETECTOR:
             company_info['RUT'] = rows[0].findChild('td').getText().strip() if rows and len(rows) > 0 else ''
             company_info['Nombre'] = rows[1].findChild('td').getText().strip() if rows and len(rows) > 1 else ''
             
-            print(f"Analizando empresa: {company_info['Nombre']} (RUT: {company_info['RUT']})")
-            
             # Acceder a la sección de Memoria Anual
             try:
-                WebDriverWait(main_driver, 15).until(EC.presence_of_element_located((By.ID, 'cmfBtnMenuValor')))
+                WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, 'cmfBtnMenuValor')))
                 
-                # Intentamos encontrar específicamente "Memoria Anual" en las pestañas de navegación
-                pestañas = main_driver.find_elements(By.CSS_SELECTOR, '.nav-tabs li a')
-                memoria_found = False
+                # Usar JavaScript para hacer clic en el enlace, más confiable
+                memoria_link = driver.find_element(By.LINK_TEXT, 'Memoria Anual')
+                driver.execute_script("arguments[0].click();", memoria_link)
                 
-                for pestaña in pestañas:
-                    if "Memoria Anual" in pestaña.text:
-                        print("Encontrada pestaña de Memoria Anual")
-                        main_driver.execute_script("arguments[0].click();", pestaña)
-                        memoria_found = True
-                        time.sleep(3)
-                        break
-                
-                # Si no encontramos la pestaña en la navegación, buscamos como enlace directo
-                if not memoria_found:
-                    try:
-                        memoria_link = main_driver.find_element(By.LINK_TEXT, 'Memoria Anual')
-                        main_driver.execute_script("arguments[0].click();", memoria_link)
-                        print("Encontrado enlace a Memoria Anual")
-                        time.sleep(3)
-                    except NoSuchElementException:
-                        print("No se encontró enlace a Memoria Anual")
-                        return company_info, external_links
+                time.sleep(5)  # Esperar a que cargue la página
                 
                 # Verificar si la página actual es externa a CMF
-                current_url = main_driver.current_url
+                current_url = driver.current_url
                 parsed_original = urllib.parse.urlparse(original_url)
                 parsed_current = urllib.parse.urlparse(current_url)
                 
@@ -222,8 +322,8 @@ class CMF_REDIRECTION_DETECTOR:
                     try:
                         # Obtener todos los años disponibles del dropdown
                         try:
-                            WebDriverWait(main_driver, 10).until(EC.presence_of_element_located((By.ID, 'aa')))
-                            years_select = Select(main_driver.find_element(By.ID, 'aa'))
+                            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, 'aa')))
+                            years_select = Select(driver.find_element(By.ID, 'aa'))
                             available_years = [opt.text.strip() for opt in years_select.options if opt.text.strip()]
                             
                             print(f"Años disponibles: {available_years}")
@@ -235,87 +335,54 @@ class CMF_REDIRECTION_DETECTOR:
                             # Para cada año, verificar los enlaces de descarga
                             for year in available_years:
                                 try:
-                                    print(f"\nVerificando año: {year}")
                                     # Usar JavaScript para seleccionar el año, evitando problemas de scrolling
-                                    select_element = main_driver.find_element(By.ID, 'aa')
-                                    main_driver.execute_script(
+                                    select_element = driver.find_element(By.ID, 'aa')
+                                    driver.execute_script(
                                         f"var select = arguments[0]; "
-                                        f"for(var i=0; i<select.options.length; i++) {{"
-                                        f"  if(select.options[i].text.trim() === '{year}') {{"
-                                        f"    select.selectedIndex = i;"
-                                        f"    var event = new Event('change', {{ bubbles: true }});"
-                                        f"    select.dispatchEvent(event);"
-                                        f"    break;"
-                                        f"  }}"
-                                        f"}}", 
+                                        f"var option = select.querySelector('option[value=\"{year}\"]'); "
+                                        f"if(option) {{ select.value = option.value; var event = new Event('change', {{ bubbles: true }}); "
+                                        f"select.dispatchEvent(event); }}", 
                                         select_element
                                     )
                                     
-                                    time.sleep(3)  # Esperar a que se actualice la lista de archivos
+                                    time.sleep(3)
+                                    
+                                    # Hacer clic en la flecha para mostrar archivos
+                                    try:
+                                        arrow_button = driver.find_element(By.CLASS_NAME, 'arriba')
+                                        driver.execute_script("arguments[0].click();", arrow_button)
+                                        time.sleep(1)
+                                    except NoSuchElementException:
+                                        print(f"No se encontró botón para mostrar archivos en el año {year}")
+                                    except Exception as e:
+                                        print(f"Error al hacer clic en botón de archivos del año {year}: {e}")
                                     
                                     # Buscar enlaces de descarga
-                                    descargar_links = main_driver.find_elements(By.XPATH, "//a[contains(text(), 'Descargar')]")
-                                    
-                                    if not descargar_links:
-                                        print(f"No se encontraron enlaces 'Descargar' para el año {year}")
-                                    else:
-                                        print(f"Se encontraron {len(descargar_links)} enlaces de descarga para el año {year}")
-                                    
-                                    # Para cada enlace "Descargar", verificar si redirecciona
-                                    for idx, descargar_link in enumerate(descargar_links):
-                                        href = descargar_link.get_attribute('href')
-                                        link_text = descargar_link.text.strip()
-                                        
-                                        if not href:
-                                            continue
-                                            
-                                        print(f"Analizando enlace {idx+1}/{len(descargar_links)}: {link_text}")
-                                        
-                                        # Verificamos si el enlace es directo a un PDF o HTML
-                                        if href.lower().endswith('.pdf'):
-                                            print(f"Enlace directo a PDF: {href}")
-                                            # Este es un PDF directo, no necesitamos verificarlo más
-                                            continue
-                                            
-                                        # Si no es PDF directo, abrimos el enlace en un nuevo navegador para verificar la redirección
-                                        print(f"Verificando si hay redirección en: {href}")
-                                        
-                                        # Crear una nueva instancia del navegador para verificar la redirección
-                                        redirect_driver = self.setup_driver()
-                                        try:
-                                            redirect_driver.get(href)
-                                            time.sleep(5)  # Esperar a que se complete cualquier redirección
-                                            
-                                            final_url = redirect_driver.current_url
-                                            parsed_final = urllib.parse.urlparse(final_url)
-                                            
-                                            is_external = parsed_final.netloc != '' and parsed_final.netloc != 'www.cmfchile.cl'
-                                            
-                                            # Si terminamos en un dominio distinto, es una redirección externa
-                                            if is_external:
-                                                print(f"¡REDIRECCIÓN DETECTADA! URL final: {final_url}")
-                                                external_links.append({
-                                                    'tipo': 'enlace_descarga',
-                                                    'año': year,
-                                                    'url': final_url
-                                                })
-                                            else:
-                                                # También verificamos si aunque estamos en el mismo dominio, 
-                                                # la URL final no es un PDF (podría ser un visor interno u otro formato)
-                                                if not final_url.lower().endswith('.pdf'):
-                                                    print(f"¡Enlace interno no-PDF detectado! URL final: {final_url}")
+                                    try:
+                                        links = driver.find_elements(By.CSS_SELECTOR, 'table#Tabla>tbody>tr>td>a')
+                                        for download_link in links:
+                                            href = download_link.get_attribute('href')
+                                            if href:
+                                                # MEJORA: Verificar realmente si el enlace es PDF o portal externo
+                                                is_pdf, is_external, final_url = self.check_if_pdf_or_external(driver, href)
+                                                
+                                                if is_external:
+                                                    print(f"¡Portal externo detectado en año {year}!")
+                                                    external_links.append({
+                                                        'tipo': 'portal_externo',
+                                                        'año': year,
+                                                        'url': final_url
+                                                    })
+                                                elif not is_pdf:
+                                                    # Si no es PDF ni portal externo reconocible, lo marcamos como potencial
+                                                    print(f"¡Enlace no reconocido como PDF en año {year}!")
                                                     external_links.append({
                                                         'tipo': 'enlace_no_pdf',
                                                         'año': year,
                                                         'url': final_url
                                                     })
-                                                    
-                                        except Exception as e:
-                                            print(f"Error al verificar redirección para {href}: {e}")
-                                        finally:
-                                            # Cerramos este navegador específico para la redirección
-                                            redirect_driver.quit()
-                                            
+                                    except Exception as e:
+                                        print(f"Error al buscar enlaces de descarga para el año {year}: {e}")
                                 except ElementNotInteractableException:
                                     print(f"No se puede interactuar con la opción del año {year}")
                                     continue
@@ -330,7 +397,7 @@ class CMF_REDIRECTION_DETECTOR:
                 
                 # Buscar también iframes que puedan contener portales externos
                 try:
-                    iframes = main_driver.find_elements(By.TAG_NAME, 'iframe')
+                    iframes = driver.find_elements(By.TAG_NAME, 'iframe')
                     for iframe in iframes:
                         iframe_src = iframe.get_attribute('src')
                         if iframe_src:
@@ -353,7 +420,7 @@ class CMF_REDIRECTION_DETECTOR:
         except Exception as e:
             print(f"Error al acceder a URL {original_url}: {e}")
         finally:
-            main_driver.quit()
+            driver.quit()
             
         return company_info, external_links
     
